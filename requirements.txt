@@ -1,6 +1,6 @@
+streamlit
 pandas
 requests
-streamlit
 python-dotenv
-pyyaml
 openpyxl
+google-auth
