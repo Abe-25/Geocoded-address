@@ -174,24 +174,12 @@ def get_google_access_token() -> Optional[str]:
 
 # ── Sidebar Configuration & Prompt Suggestions ───────────────────────────────
 with st.sidebar:
-    st.subheader("⚙️ API Configuration")
-    st.caption(f"Loaded config from: `{env_loaded_name}`")
-
-    cfg_project = st.text_input("GCP Project ID", value=project_id)
-    cfg_engine = st.text_input("Discovery Engine ID", value=engine_id)
-    cfg_assistant = st.text_input("Assistant ID", value=assistant_id)
-    cfg_url = st.text_input("API URL Endpoint", value=resolved_api_url)
-
-    st.markdown("---")
-    st.subheader("🔐 Google Cloud Auth")
-    auto_token = get_google_access_token()
-    manual_token = st.text_input(
-        "Bearer Access Token (optional override)",
-        value=auto_token or "",
-        type="password",
-        help="Leave default if ADC (Application Default Credentials) is active or paste a gcloud token.",
-    )
-    active_token = manual_token.strip() or auto_token
+    with st.expander("⚙️ Advanced API Settings", expanded=False):
+        st.caption(f"Loaded config from: `{env_loaded_name}`")
+        cfg_project = st.text_input("GCP Project ID", value=project_id)
+        cfg_engine = st.text_input("Discovery Engine ID", value=engine_id)
+        cfg_assistant = st.text_input("Assistant ID", value=assistant_id)
+        cfg_url = st.text_input("API URL Endpoint", value=resolved_api_url)
 
     st.markdown("---")
     st.subheader("💡 Geocoding Prompts & Presets")
@@ -487,7 +475,7 @@ def parse_stream_assist_response(raw_text: str) -> Tuple[Optional[str], Optional
         # Streaming deltas: join without spaces to avoid breaking JSON tokens and floats
         return "".join(collected), None
 
-    return None, f"No completed answer text returned ({text[:80]})"
+    return None, "No completed answer text returned"
 
 
 def query_stream_assist_with_retry(
@@ -560,7 +548,7 @@ def query_stream_assist_with_retry(
                     resolved_location=None,
                     match_type=None,
                     geocode_status="FAILED",
-                    error_message=f"HTTP {response.status_code}: {response.text[:250]}",
+                    error_message=f"API request failed (HTTP {response.status_code})",
                     raw_response=last_raw[:500],
                 )
 
@@ -589,14 +577,13 @@ def query_stream_assist_with_retry(
                     raw_response=ans_text,
                 )
             else:
-                snippet = (ans_text[:160] + "...") if len(ans_text) > 160 else ans_text
                 return GeocodeResult(
                     latitude=None,
                     longitude=None,
                     resolved_location=res_loc,
                     match_type=m_type or "unresolved_geometry",
                     geocode_status="UNRESOLVED",
-                    error_message=f"Coordinates missing or outside valid range (-90..90, -180..180). Output: {snippet}",
+                    error_message="Coordinates missing or outside valid range (-90..90, -180..180)",
                     raw_response=ans_text[:500],
                 )
 
@@ -657,130 +644,222 @@ def generate_excel_workbook(result_df: pd.DataFrame, summary_data: Dict[str, Any
 
 
 # ── Main UI: File Upload & Processing ────────────────────────────────────────
-uploaded_file = st.file_uploader("Upload Excel File with Addresses (.xlsx, .xls)", type=["xlsx", "xls"])
+auto_token = get_google_access_token()
+manual_token = st.text_input(
+    "🔐 Bearer Access Token",
+    value=auto_token or "",
+    type="password",
+    help="Leave default if ADC (Application Default Credentials) is active or paste a gcloud token.",
+)
+active_token = manual_token.strip() or auto_token
 
-if uploaded_file is not None:
-    try:
-        df = pd.read_excel(uploaded_file)
-        st.success(f"File loaded successfully ({len(df)} rows, {len(df.columns)} columns)")
-    except Exception as e:
-        st.error(f"Error loading Excel file: {e}")
-        st.stop()
+tab_batch, tab_single = st.tabs(["📁 Batch Geocoding (Excel Upload)", "📍 Single Address Geocoding"])
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        columns = list(df.columns)
-        default_idx = 0
-        for i, col_name in enumerate(columns):
-            if any(term in str(col_name).lower() for term in ["address", "location", "street", "city", "postal", "postcode", "zip", "pcode"]):
-                default_idx = i
-                break
-        selected_col = st.selectbox("Select Address Column", columns, index=default_idx)
+with tab_batch:
+    uploaded_file = st.file_uploader("Upload Excel File with Addresses (.xlsx, .xls)", type=["xlsx", "xls"])
 
-    with col2:
-        max_rows = st.number_input("Max rows to process (0 = all)", min_value=0, max_value=len(df), value=0)
-
-    with st.expander("Preview Uploaded Data", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
-
-    if st.button("🚀 Start Geocoding", type="primary", use_container_width=True):
-        if not active_token:
-            st.error("No valid Google Cloud access token found. Please run `gcloud auth application-default login` or provide a Bearer Token in the sidebar.")
+    if uploaded_file is not None:
+        try:
+            df = pd.read_excel(uploaded_file)
+            st.success(f"File loaded successfully ({len(df)} rows, {len(df.columns)} columns)")
+        except Exception as e:
+            st.error(f"Error loading Excel file: {e}")
             st.stop()
 
-        rows_to_process = df if max_rows == 0 else df.head(max_rows)
-        total_rows = len(rows_to_process)
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            columns = list(df.columns)
+            default_idx = 0
+            for i, col_name in enumerate(columns):
+                if any(term in str(col_name).lower() for term in ["address", "location", "street", "city", "postal", "postcode", "zip", "pcode"]):
+                    default_idx = i
+                    break
+            selected_col = st.selectbox("Select Address Column", columns, index=default_idx)
 
-        latitudes: List[Optional[float]] = []
-        longitudes: List[Optional[float]] = []
-        resolved_locations: List[Optional[str]] = []
-        match_types: List[Optional[str]] = []
-        statuses: List[str] = []
-        error_messages: List[Optional[str]] = []
+        with col2:
+            max_rows = st.number_input("Max rows to process (0 = all)", min_value=0, max_value=len(df), value=0)
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        with st.expander("Preview Uploaded Data", expanded=False):
+            st.dataframe(df.head(10), use_container_width=True)
 
-        # Use persistent HTTP Session for socket reuse & performance
-        with requests.Session() as http_session:
-            for idx, (_, row) in enumerate(rows_to_process.iterrows()):
-                addr_val = row[selected_col]
-                addr_str = "" if pd.isna(addr_val) else str(addr_val).strip()
-                status_text.text(f"Processing row {idx + 1}/{total_rows}: {addr_str[:45]}...")
+        if st.button("🚀 Start Geocoding", type="primary", use_container_width=True):
+            if not active_token:
+                st.error("No valid Google Cloud access token found. Please run `gcloud auth application-default login` or provide a Bearer Access Token above.")
+                st.stop()
 
-                res = query_stream_assist_with_retry(
-                    address=addr_str,
-                    prompt_template=custom_prompt,
-                    token=active_token,
-                    endpoint=cfg_url,
-                    project=cfg_project,
-                    session=http_session,
-                    max_retries=cfg_max_retries,
-                    timeout=cfg_timeout,
-                )
+            rows_to_process = df if max_rows == 0 else df.head(max_rows)
+            total_rows = len(rows_to_process)
 
-                latitudes.append(res.latitude)
-                longitudes.append(res.longitude)
-                resolved_locations.append(res.resolved_location)
-                match_types.append(res.match_type)
-                statuses.append(res.geocode_status)
-                error_messages.append(res.error_message)
+            latitudes: List[Optional[float]] = []
+            longitudes: List[Optional[float]] = []
+            resolved_locations: List[Optional[str]] = []
+            match_types: List[Optional[str]] = []
+            statuses: List[str] = []
+            error_messages: List[Optional[str]] = []
 
-                progress_bar.progress((idx + 1) / total_rows)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-        status_text.text("Geocoding process finished!")
+            # Use persistent HTTP Session for socket reuse & performance
+            with requests.Session() as http_session:
+                for idx, (_, row) in enumerate(rows_to_process.iterrows()):
+                    addr_val = row[selected_col]
+                    addr_str = "" if pd.isna(addr_val) else str(addr_val).strip()
+                    status_text.text(f"Processing row {idx + 1}/{total_rows}: {addr_str[:45]}...")
 
-        # Build output dataframe
-        result_df = rows_to_process.copy()
-        result_df["latitude"] = latitudes
-        result_df["longitude"] = longitudes
-        result_df["resolved_location"] = resolved_locations
-        result_df["match_type"] = match_types
-        result_df["geocode_status"] = statuses
-        result_df["error_message"] = error_messages
+                    res = query_stream_assist_with_retry(
+                        address=addr_str,
+                        prompt_template=custom_prompt,
+                        token=active_token,
+                        endpoint=cfg_url,
+                        project=cfg_project,
+                        session=http_session,
+                        max_retries=cfg_max_retries,
+                        timeout=cfg_timeout,
+                    )
 
-        # ── Executive Summary Report Calculations ────────────────────────────
-        success_count = sum(1 for s in statuses if s == "SUCCESS")
-        unresolved_count = sum(1 for s in statuses if s == "UNRESOLVED")
-        failed_count = sum(1 for s in statuses if s == "FAILED")
-        skipped_count = sum(1 for s in statuses if s == "SKIPPED_EMPTY")
-        success_rate = (success_count / total_rows * 100.0) if total_rows > 0 else 0.0
+                    latitudes.append(res.latitude)
+                    longitudes.append(res.longitude)
+                    resolved_locations.append(res.resolved_location)
+                    match_types.append(res.match_type)
+                    statuses.append(res.geocode_status)
+                    error_messages.append(res.error_message)
 
-        summary_metrics = {
-            "total": total_rows,
-            "successful": success_count,
-            "unresolved": unresolved_count,
-            "failed": failed_count,
-            "skipped": skipped_count,
-            "success_rate": success_rate,
+                    progress_bar.progress((idx + 1) / total_rows)
+
+            status_text.text("Geocoding process finished!")
+
+            # Build output dataframe
+            result_df = rows_to_process.copy()
+            result_df["latitude"] = latitudes
+            result_df["longitude"] = longitudes
+            result_df["resolved_location"] = resolved_locations
+            result_df["match_type"] = match_types
+            result_df["geocode_status"] = statuses
+            result_df["error_message"] = error_messages
+
+            # ── Executive Summary Report Calculations ────────────────────────────
+            success_count = sum(1 for s in statuses if s == "SUCCESS")
+            unresolved_count = sum(1 for s in statuses if s == "UNRESOLVED")
+            failed_count = sum(1 for s in statuses if s == "FAILED")
+            skipped_count = sum(1 for s in statuses if s == "SKIPPED_EMPTY")
+            success_rate = (success_count / total_rows * 100.0) if total_rows > 0 else 0.0
+
+            summary_metrics = {
+                "total": total_rows,
+                "successful": success_count,
+                "unresolved": unresolved_count,
+                "failed": failed_count,
+                "skipped": skipped_count,
+                "success_rate": success_rate,
+            }
+
+            st.markdown("<h3 style='margin-top: 1.5rem;'>📈 Executive Summary Report</h3>", unsafe_allow_html=True)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Processed", total_rows)
+            m2.metric("Successful (Coordinates Resolved)", success_count, delta=f"{success_rate:.1f}%")
+            m3.metric("Unresolved", unresolved_count, help="Inputs that could not be mapped to valid coordinates")
+            m4.metric("Failed / Empty", failed_count + skipped_count, delta=f"-{failed_count} errors" if failed_count else None, delta_color="inverse")
+
+            # Map Visualization
+            map_df = result_df.dropna(subset=["latitude", "longitude"])
+            if not map_df.empty:
+                st.subheader("🗺️ Geocoded Locations Map")
+                st.map(map_df[["latitude", "longitude"]])
+
+            st.subheader("📊 Output Preview")
+            st.dataframe(result_df, use_container_width=True)
+
+            # Multi-sheet Excel export
+            excel_data = generate_excel_workbook(result_df, summary_metrics)
+
+            st.download_button(
+                label="📥 Download Geocoded Excel File (With Summary Sheet)",
+                data=excel_data,
+                file_name=f"geocoded_addresses_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True,
+            )
+    else:
+        st.info("Please upload an Excel file containing addresses in the panel above to begin.")
+
+with tab_single:
+    st.subheader("📍 Geocode a Single Address")
+    single_address = st.text_input(
+        "Enter Address or Postal Code",
+        placeholder="e.g., 10 Downing Street, London SW1A 2AA or 90210, USA",
+    )
+    if st.button("📍 Geocode Address", type="primary", use_container_width=True):
+        if not active_token:
+            st.error("No valid Google Cloud access token found. Please run `gcloud auth application-default login` or provide a Bearer Access Token above.")
+            st.stop()
+        if not single_address.strip():
+            st.warning("Please enter an address or postal code.")
+        else:
+            with st.spinner("Geocoding location..."):
+                with requests.Session() as http_session:
+                    res = query_stream_assist_with_retry(
+                        address=single_address.strip(),
+                        prompt_template=custom_prompt,
+                        token=active_token,
+                        endpoint=cfg_url,
+                        project=cfg_project,
+                        session=http_session,
+                        max_retries=cfg_max_retries,
+                        timeout=cfg_timeout,
+                    )
+            st.session_state["single_result"] = (single_address.strip(), res)
+
+    if "single_result" in st.session_state:
+        addr_text, res = st.session_state["single_result"]
+        if res.geocode_status == "SUCCESS":
+            st.success(f"**Resolved Location:** {res.resolved_location}")
+            sm1, sm2, sm3 = st.columns(3)
+            sm1.metric("Latitude", f"{res.latitude:.6f}")
+            sm2.metric("Longitude", f"{res.longitude:.6f}")
+            sm3.metric("Match Type", res.match_type or "geocoded")
+
+            map_df = pd.DataFrame([{"latitude": res.latitude, "longitude": res.longitude}])
+            st.subheader("🗺️ Location Map")
+            st.map(map_df)
+        elif res.geocode_status == "UNRESOLVED":
+            st.warning(f"Could not resolve coordinates: {res.error_message or 'Unresolved address'}")
+            if res.resolved_location:
+                st.caption(f"Identified location string: {res.resolved_location}")
+        elif res.geocode_status == "SKIPPED_EMPTY":
+            st.warning("The address input was empty or whitespace.")
+        else:
+            st.error(f"Geocoding failed: {res.error_message or 'Unknown error'}")
+
+        # Build output dataframe and summary for single address download
+        single_df = pd.DataFrame([{
+            "input_address": addr_text,
+            "latitude": res.latitude,
+            "longitude": res.longitude,
+            "resolved_location": res.resolved_location,
+            "match_type": res.match_type,
+            "geocode_status": res.geocode_status,
+            "error_message": res.error_message,
+        }])
+        single_summary = {
+            "total": 1,
+            "successful": 1 if res.geocode_status == "SUCCESS" else 0,
+            "unresolved": 1 if res.geocode_status == "UNRESOLVED" else 0,
+            "failed": 1 if res.geocode_status == "FAILED" else 0,
+            "skipped": 1 if res.geocode_status == "SKIPPED_EMPTY" else 0,
+            "success_rate": 100.0 if res.geocode_status == "SUCCESS" else 0.0,
         }
-
-        st.markdown("<h3 style='margin-top: 1.5rem;'>📈 Executive Summary Report</h3>", unsafe_allow_html=True)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Processed", total_rows)
-        m2.metric("Successful (Coordinates Resolved)", success_count, delta=f"{success_rate:.1f}%")
-        m3.metric("Unresolved", unresolved_count, help="Inputs that could not be mapped to valid coordinates")
-        m4.metric("Failed / Empty", failed_count + skipped_count, delta=f"-{failed_count} errors" if failed_count else None, delta_color="inverse")
-
-        # Map Visualization
-        map_df = result_df.dropna(subset=["latitude", "longitude"])
-        if not map_df.empty:
-            st.subheader("🗺️ Geocoded Locations Map")
-            st.map(map_df[["latitude", "longitude"]])
+        single_excel_data = generate_excel_workbook(single_df, single_summary)
 
         st.subheader("📊 Output Preview")
-        st.dataframe(result_df, use_container_width=True)
-
-        # Multi-sheet Excel export
-        excel_data = generate_excel_workbook(result_df, summary_metrics)
+        st.dataframe(single_df, use_container_width=True)
 
         st.download_button(
             label="📥 Download Geocoded Excel File (With Summary Sheet)",
-            data=excel_data,
-            file_name=f"geocoded_addresses_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            data=single_excel_data,
+            file_name=f"geocoded_single_address_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
         )
-else:
-    st.info("Please upload an Excel file containing addresses in the panel above to begin.")
